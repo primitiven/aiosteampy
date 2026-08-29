@@ -726,7 +726,7 @@ class MarketComponent(MarketPublicComponent):
             r = await self._transport.request(
                 "POST",
                 MARKET_URL / f"buylisting/{listing_id}",
-                multipart=data,
+                data=data,
                 headers={"Referer": str(MARKET_URL / f"listings/{app.id}/{market_hash_name}")},  # mandatory
                 response_mode="json",
             )
