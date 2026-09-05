@@ -645,6 +645,7 @@ class MarketPublicComponent(EconMixin):
         :raises ValueError: failed to find `bucket group id` in redirect location.
         :raises TransportError: ordinary reasons.
         """
+
         if isinstance(obj, ItemDescription):
             url = obj.market_url
         else:
@@ -655,6 +656,7 @@ class MarketPublicComponent(EconMixin):
             url,
             headers={"Referer": COMMUNITY_ORIGIN},
             response_mode="meta",
+            redirects=False,
         )
 
         location = r.headers.get("location")
