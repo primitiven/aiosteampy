@@ -18,6 +18,11 @@ from ...state import PublicSteamState
 from .models import (
     ActivityEntry,
     ActivityType,
+    Bucket,
+    BucketChartEntry,
+    BucketGroup,
+    BucketGroupChart,
+    Buckets,
     BuyOrderTableEntry,
     FacetListingPair,
     FacetListingTag,
@@ -55,6 +60,8 @@ ITEM_NAME_ID_RE = re.compile(r"Market_LoadOrderSpread\(\s?(\d+)\s?\)")
 BUCKET_GROUP_ID_RE = re.compile(r"/listings/\d+/([^/?]+)")
 PRICE_HISTORY_RE = re.compile(r"var line1=(.+?);")
 PRICE_ENTRY_TIME_FORMAT = "%b %d %Y %H: %z"
+SSR_LOADER_DATA_RE = re.compile(r"window\.SSR\.loaderData = (\[.+\]);")
+SSR_RENDER_CTX_RE = re.compile(r"window\.SSR\.renderContext=JSON\.parse\((.+)\);")
 
 # Steam current limit
 LISTING_COUNT = 10
@@ -631,41 +638,6 @@ class MarketPublicComponent(EconMixin):
         return res
 
     @overload
-    async def get_bucket_group_id(self, obj: ItemDescription) -> str: ...
-    @overload
-    async def get_bucket_group_id(self, obj: str, app: App) -> str: ...
-    async def get_bucket_group_id(self, obj: str | ItemDescription, app: App | None = None) -> str:
-        """
-        Get `bucket group id` for Modern Market items.
-
-        :param obj: `market hash name` of item or ``ItemDescription``.
-        :param app: `Steam` app.
-        :return: `bucket group id`.
-        :raises TooManyRequests: rate limit has been hit.
-        :raises ValueError: failed to find `bucket group id` in redirect location.
-        :raises TransportError: ordinary reasons.
-        """
-        if isinstance(obj, ItemDescription):
-            url = obj.market_url
-        else:
-            url = MARKET_URL / f"listings/{app.id}/{obj}"
-
-        r = await self._transport.request(
-            "GET",
-            url,
-            headers={"Referer": COMMUNITY_ORIGIN},
-            response_mode="meta",
-        )
-
-        location = r.headers.get("location")
-        search = BUCKET_GROUP_ID_RE.search(location) if location else None
-        res = search.group(1) if search is not None else search
-        if not res:
-            raise ValueError("Failed to find bucket group id")
-
-        return res
-
-    @overload
     async def get_price_history(self, obj: ItemDescription) -> list[PriceHistoryEntry]: ...
     @overload
     async def get_price_history(self, obj: str, app: App) -> list[PriceHistoryEntry]: ...
@@ -1065,6 +1037,8 @@ class MarketPublicComponent(EconMixin):
             for data in rj["results"]
         ]
 
+    # beta modern market scope
+
     @staticmethod
     def _beta_market_enabled[F: Callable[[...], Any]](func: F) -> F:
         """Verify whether modern(beta) market is enabled."""
@@ -1094,7 +1068,7 @@ class MarketPublicComponent(EconMixin):
             )
         )
 
-    @_beta_market_enabled
+    @_beta_market_enabled  # type: ignore
     async def get_search_app_facets(self, app: App) -> dict[str, dict[str, str | int | dict[str, dict[str, str]]]]:
         """Get `Steam Market` search filter facets for ``app``."""
 
@@ -1113,12 +1087,26 @@ class MarketPublicComponent(EconMixin):
 
         return rj["data"]
 
-    @_beta_market_enabled
-    async def get_asset_property_schema(self, app: App):
-        # GET https://api.steampowered.com/IEconService/GetAssetPropertySchema/v1?origin=https%3A%2F%2Fsteamcommunity.com&input_protobuf_encoded=...
-        raise NotImplementedError()
+    @staticmethod
+    def _create_orderbook(data: dict, etag: str | None = None) -> OrderBook:
+        # detach
+        buys: list[int] = data["rgCompactBuyOrders"]
+        sells: list[int] = data["rgCompactSellOrders"]
+        return OrderBook(
+            currency=Currency(data["eCurrency"]),
+            max_buy_order=data["amtMaxBuyOrder"],
+            min_sell_order=data["amtMinSellOrder"],
+            total_buy_orders=data["cBuyOrders"],
+            total_sell_orders=data["cSellOrders"],
+            buy_orders_raw=buys,
+            sell_orders_raw=sells,
+            # lazy generators as there are many entries, so no need to iterate over them again
+            buy_orders=((buys[i], buys[i + 1]) for i in range(0, len(buys), 2)),
+            sell_orders=((sells[i], sells[i + 1]) for i in range(0, len(sells), 2)),
+            etag=etag,
+        )
 
-    @_beta_market_enabled
+    @_beta_market_enabled  # type: ignore
     async def get_orderbook(self, app: App, bucket_id: str, etag: str | None = None) -> OrderBook:
         """
         Get orders information for ``bucket_id``.
@@ -1149,27 +1137,11 @@ class MarketPublicComponent(EconMixin):
             headers=headers,
             response_mode="json",
         )
-        rj: dict = r.content
+        rj: dict = r.content  # type: ignore
 
         EResultError.check_data(rj)
 
-        data = rj["data"]["data"]  # nice
-
-        buys: list[int] = data["rgCompactBuyOrders"]
-        sells: list[int] = data["rgCompactSellOrders"]
-        return OrderBook(
-            currency=Currency(data["eCurrency"]),
-            max_buy_order=data["amtMaxBuyOrder"],
-            min_sell_order=data["amtMinSellOrder"],
-            total_buy_orders=data["cBuyOrders"],
-            total_sell_orders=data["cSellOrders"],
-            buy_orders_raw=buys,
-            sell_orders_raw=sells,
-            # lazy generators as there are many entries, so no need to iterate over them again
-            buy_orders=((buys[i], buys[i + 1]) for i in range(0, len(buys), 2)),
-            sell_orders=((sells[i], sells[i + 1]) for i in range(0, len(sells), 2)),
-            etag=r.headers["ETag"],
-        )
+        return self._create_orderbook(rj["data"]["data"], r.headers["ETag"])
 
     @classmethod
     def _crate_modern_search_result_items(cls, results: list[dict]) -> tuple[ModernSearchItem, ...]:
@@ -1190,7 +1162,7 @@ class MarketPublicComponent(EconMixin):
     async def modern_search(self, app_or_query: App | SearchQuery, *, page: int = ...) -> ModernSearchResults: ...
     @overload
     async def modern_search(self, app_or_query: App | SearchQuery, *, start: int = ...) -> ModernSearchResults: ...
-    @_beta_market_enabled
+    @_beta_market_enabled  # type: ignore
     async def modern_search(
         self,
         app_or_query: App | SearchQuery,
@@ -1205,7 +1177,7 @@ class MarketPublicComponent(EconMixin):
             * This request is rate limited by `Steam`.
             * Price values will be returned in **available regional currencies (IP dependent)**.
 
-        :param app_or_query: `Steam` app of requested results or prepared builder with desired ``query``.
+        :param app_or_query: `Steam` app of requested listings or ``query`` .
         :param page: number of ``page`` to be requested. **Starts from 0**.
         :param start: results window offset index. Mutually exclusive with ``page``.
         :raises TransportError: ordinary reasons.
@@ -1308,7 +1280,7 @@ class MarketPublicComponent(EconMixin):
         )
 
     @classmethod
-    def _create_facets_iterable(cls, facets: list[dict[str, int | dict[str, str]]]) -> Iterable[FacetListingPair]:
+    def _create_facets_iterable(cls, facets: list[dict]) -> Iterable[FacetListingPair]:
         if not facets:
             return ()
 
@@ -1323,6 +1295,19 @@ class MarketPublicComponent(EconMixin):
                 ),
             )
             for facet in facets
+        )
+
+    @classmethod
+    def _create_modern_listings_container(cls, data: dict):
+        if not data:
+            return Listings()
+
+        facets: list[dict] = data["facets"]  # detach object
+        return Listings(
+            facets=cls._create_facets_iterable(facets),
+            listings=cls._create_modern_listings(data["listings"]),
+            more=data["more"],
+            total_count=data["total_count"],
         )
 
     @overload
@@ -1341,7 +1326,7 @@ class MarketPublicComponent(EconMixin):
         *,
         start: int = ...,
     ) -> Listings: ...
-    @_beta_market_enabled
+    @_beta_market_enabled  # type: ignore
     async def get_modern_listings(
         self,
         bucket_group_id: str,
@@ -1360,7 +1345,7 @@ class MarketPublicComponent(EconMixin):
         .. seealso:: https://github.com/somespecialone/steam-market-ids - repo storage with `bucket group ids`.
 
         :param bucket_group_id: id of `bucket group` (like G123E456...).
-        :param app_or_query: `Steam` app of requested listings or prepared builder with desired ``query``.
+        :param app_or_query: `Steam` app of requested listings or ``query`` .
         :param page: number of ``page`` to be requested. **Starts from 0**.
         :param start: results window offset index. Mutually exclusive with ``page``.
         :raises TransportError: ordinary reasons.
@@ -1377,6 +1362,7 @@ class MarketPublicComponent(EconMixin):
         else:
             query = app_or_query
             app = query.app
+            assert app
 
         if page:
             start = MODERN_LISTINGS_LIMIT * page
@@ -1397,20 +1383,205 @@ class MarketPublicComponent(EconMixin):
             response_mode="json",
         )
 
-        rj: dict = r.content
-
+        rj: dict = r.content  # type: ignore
         if not rj:
             raise SteamError("Empty response")
 
-        data = rj["data"]
-        if not data:
-            return Listings()
+        return self._create_modern_listings_container(rj["data"])
 
-        facets: list[dict] = data["facets"]  # detach object
+    @overload
+    async def get_bucket_group_id(self, obj: ItemDescription) -> str: ...
+    @overload
+    async def get_bucket_group_id(self, obj: str, app: App) -> str: ...
+    @_beta_market_enabled  # type: ignore
+    async def get_bucket_group_id(self, obj: str | ItemDescription, app: App | None = None) -> str:
+        """
+        Get `bucket group id` for Modern Market items.
 
-        return Listings(
-            facets=self._create_facets_iterable(facets),
-            listings=self._create_modern_listings(data["listings"]),
-            more=data["more"],
-            total_count=data["total_count"],
+        :param obj: `market hash name` of item or ``ItemDescription``.
+        :param app: `Steam` app.
+        :return: `bucket group id`.
+        :raises TooManyRequests: rate limit has been hit.
+        :raises ValueError: failed to find `bucket group id` in redirect location.
+        :raises TransportError: ordinary reasons.
+        """
+
+        if isinstance(obj, ItemDescription):
+            url = obj.market_url
+        else:
+            assert app
+            url = MARKET_URL / f"listings/{app.id}/{obj}"
+
+        r = await self._transport.request(
+            "GET",
+            url,
+            headers={"Referer": COMMUNITY_ORIGIN},
+            response_mode="meta",
+            redirects=False,
         )
+
+        location = r.headers.get("location")
+        search = BUCKET_GROUP_ID_RE.search(location) if location else None
+        res = search.group(1) if search is not None else search
+        if not res:
+            raise ValueError("Failed to find bucket group id")
+
+        return res
+
+    @_beta_market_enabled  # type: ignore
+    async def _get_bucket_group_page(self, bucket_group_id: str, app_or_query: App | ListingsQuery) -> str:
+        if isinstance(app_or_query, App):
+            app = app_or_query
+            query = ListingsQuery(app=app)
+        else:
+            query = app_or_query
+            app = query.app
+            assert app
+
+        _, ref_params = query.build(bucket_group_id, 0, self._state.currency)
+
+        r = await self._transport.request(
+            "GET",
+            LISTINGS_URL / f"{app.id}/{bucket_group_id}",
+            params=(("l", self._state.language), *ref_params),
+            response_mode="text",
+        )
+        return r.content  # type: ignore
+
+    @staticmethod
+    def _extract_buckets(page_text: str) -> Buckets:
+        search = SSR_LOADER_DATA_RE.search(page_text)
+        res = search.group(1) if search is not None else search
+        if not res:
+            raise ValueError("Failed to find ssr data")
+
+        raw_loader_data: list[str] = json.loads(res)
+        buckets_res: dict | None = json.loads(raw_loader_data[3])
+        buckets_data: Sequence[dict] = buckets_res["buckets"] if buckets_res else ()
+
+        return {
+            bd["bucket_id"]: Bucket(
+                bd["bucket_id"],
+                int(bd["classid"]),
+                (bf for bf in bd.get("filters", ())),
+                int(bd["min_price"]),
+            )
+            for bd in buckets_data
+        }
+
+    async def get_buckets(self, bucket_group_id: str, app: App) -> Buckets:
+        """
+        Get buckets of Modern Market item.
+
+        .. note::
+            * This request is rate limited by `Steam`.
+            * Price values will be returned in **available regional currencies (IP dependent)**.
+
+        :param bucket_group_id: id of `bucket group` (like G123E456...).
+        :param app: `Steam` app.
+        :return: sequence of buckets data.
+        :raises TooManyRequests: rate limit has been hit.
+        :raises ValueError: failed to find buckets data.
+        :raises TransportError: ordinary reasons.
+        """
+
+        rt = await self._get_bucket_group_page(bucket_group_id, app)
+        return self._extract_buckets(rt)
+
+    @staticmethod
+    def _extract_render_ctx_queries(page_text: str) -> list[dict]:
+        search = SSR_RENDER_CTX_RE.search(page_text)
+        res = search.group(1) if search is not None else search
+        if not res:
+            raise ValueError("Failed to find ssr data")
+
+        # yeah, I suspect escape lines to mess with parsing
+        ssr_render_ctx_data: dict = json.loads(json.loads(res))
+        return json.loads(ssr_render_ctx_data["queryData"])["queries"]
+
+    @staticmethod
+    def _create_modern_chart(queries: list[dict]) -> BucketGroupChart:
+        chart: dict[str, Iterable[BucketChartEntry]] = {}
+        for price_history_state in filter(
+            lambda q: len(q["queryKey"]) > 1 and q["queryKey"][1] == "pricehistory",
+            queries,
+        ):
+            bucket_key = price_history_state["queryKey"][-1]
+            prices: list[dict] = price_history_state["state"]["data"]["prices"]  # detach
+            chart[bucket_key] = (
+                BucketChartEntry(
+                    datetime.fromtimestamp(e["time"]),
+                    e["price_median"] * 100,
+                    e["purchases"],
+                )
+                for e in prices
+            )
+
+        return chart
+
+    async def get_bucket_group_chart(self, bucket_group_id: str, app: App) -> BucketGroupChart:
+        """
+        Get bucket group chart (`Median Sale Prices` data) of Modern Market item.
+
+        .. note::
+            * This request is rate limited by `Steam`.
+            * Price values will be returned in **available regional currencies (IP dependent)**.
+
+        :param bucket_group_id: id of `bucket group` (like G123E456...).
+        :param app: `Steam` app.
+        :return: `bucket id` (old `market_hash_name`) to iterable with chart entries map.
+        :raises TooManyRequests: rate limit has been hit.
+        :raises ValueError: failed to find chart data.
+        :raises TransportError: ordinary reasons.
+        """
+
+        rt = await self._get_bucket_group_page(bucket_group_id, app)
+
+        queries = self._extract_render_ctx_queries(rt)
+        return self._create_modern_chart(queries)
+
+    async def get_bucket_group_data(self, bucket_group_id: str, app_or_query: App | ListingsQuery) -> BucketGroup:
+        """
+        Get `bucket group` data from `Modern Steam Market` webpage.
+        Allows to retrieve `listings`, `orderbook` and `chart` with single web request.
+
+        .. note::
+            * This request is rate limited by `Steam`.
+            * Price values will be returned in **available regional currencies (IP dependent)**.
+
+        :param bucket_group_id: id of `bucket group` (like G123E456...).
+        :param app_or_query: `Steam` app of requested listings or ``query`` .
+        :return: `bucket group` data container.
+        :raises TooManyRequests: rate limit has been hit.
+        :raises ValueError: failed to find ssr data.
+        :raises TransportError: ordinary reasons.
+        """
+
+        rt = await self._get_bucket_group_page(bucket_group_id, app_or_query)
+
+        buckets = self._extract_buckets(rt)
+
+        queries = self._extract_render_ctx_queries(rt)
+        chart = self._create_modern_chart(queries)
+
+        bucket_id: str = ""
+        listings: Listings = Listings()
+        orderbook: OrderBook | None = None
+
+        for query in queries:
+            query_key: list[str] = query["queryKey"]
+            if len(query_key) == 1:  # skip cookie queries
+                continue
+
+            if query_key[0] == "market_item_search":  # listings
+                listings = self._create_modern_listings_container(query["state"]["data"]["pages"][0])
+            elif query_key[1] == "orderbook":  # obviously orderbook
+                orderbook = self._create_orderbook(query["state"]["data"])
+                bucket_id = query_key[3]
+
+            # possible to extract: asset property schema and map, market accessories, bucket id(econ item) descriptions
+
+        assert orderbook
+        assert bucket_id
+
+        return BucketGroup(buckets, chart, bucket_id, listings, orderbook)

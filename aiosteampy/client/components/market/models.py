@@ -1,4 +1,4 @@
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import IntEnum, StrEnum
@@ -484,8 +484,8 @@ class OrderBook(NamedTuple):
     sell_orders: Iterable[tuple[int, int]]
     """Sell orders in `price/amount` pairs."""
 
-    etag: str
-    """`ETag` header value of response."""
+    etag: str | None
+    """`ETag` header value of response if present."""
 
 
 class ListingPricing(NamedTuple):
@@ -590,3 +590,47 @@ class Listings(NamedTuple):
     """Whether there are more `listings` that can be fetched."""
     total_count: int = 0
     """Total count of `listings` across all `pages`."""
+
+
+class Bucket(NamedTuple):
+    """Market item `bucket` data container."""
+
+    id: str
+    """`Bucket` id."""
+    class_id: int
+    """Item description id."""
+    filters: Iterable[tuple[str, str]]
+    """Market query filters for current bucket in format `(category/facet, tag)`."""
+    # localized_name: str
+    # localized_name_inside_group: str
+    min_price: int
+    """Min. price of `listing` available for current bucket."""
+
+
+Buckets = Mapping[str, Bucket]
+
+
+class BucketChartEntry(NamedTuple):
+    """Dedicated `bucket` chart (`Median Sale Prices` data) entry data container."""
+
+    time: datetime
+    """What `time` current entry reflect."""
+    price: float
+    """Median price for the current entry ``time``."""
+    purchases: int
+    """Purchases count for the current entry ``time``."""
+
+
+BucketGroupChart = Mapping[str, Iterable[BucketChartEntry]]
+
+
+class BucketGroup(NamedTuple):
+    """Bucket group data retrieved from web page."""
+
+    buckets: Buckets
+    chart: BucketGroupChart
+
+    bucket_id: str
+    """Id of `bucket` to whom ``listings`` and ``orderbook`` belongs. Old `market_hash_name`."""
+    listings: Listings
+    orderbook: OrderBook
